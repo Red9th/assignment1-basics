@@ -195,6 +195,41 @@ class BPETrainer:
         return (idx_vocab, merge_proc)
 
 
+def get_counts(text: str) -> dict[tuple[bytes, bytes], int]:
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    counts = defaultdict(int)
+    for match in re.finditer(PAT, text):
+        token = match.group()
+        token_byte_tuple = tuple(bytes([char]) for char in token.encode("utf-8"))
+        counts[token_byte_tuple] += 1
+    return counts
+
+
+def pre_tokenize(segments: list) -> list:
+    tokens = []
+    for segment in segments:
+        # Run pre-tokenization on your chunk and store the counts for each pre-token
+        counts = get_counts(segment)
+
+        for key, val in counts.items():
+            tc = TokenChain(frequency=val)
+            for i in key:
+                tc.append(i)
+            tokens.append(tc)
+    return tokens
+
+
+def process_chunk(args):
+    input_path, start, end, special_tokens = args
+
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode("utf-8", errors="ignore")
+
+    segments = re.split("|".join(map(re.escape, special_tokens)), chunk)
+    return pre_tokenize(segments)
+
+
 def byte_level_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
@@ -208,38 +243,30 @@ def byte_level_bpe(
     for token in special_tokens:
         vocab.append(token.encode())
 
+    # process pool
+    pool = multiprocessing.Pool(num_processes)
+
     # chunking and pre-tokenization
-    pre_tokens: list[TokenChain] = []
     with open(input_path, "rb") as f:
-        boundaries = find_chunk_boundaries(f, num_processes, special_tokens[0].encode())
+        boundaries = find_chunk_boundaries(
+            f,
+            num_processes,
+            special_tokens[0].encode(),
+        )
 
-        # The following is a serial implementation, but you can parallelize this
-        # by sending each start/end pair to a set of processes.
-        for start, end in zip(boundaries[:-1], boundaries[1:]):
-            f.seek(start)
-            chunk = f.read(end - start).decode("utf-8", errors="ignore")
+    tasks = [
+        (input_path, start, end, special_tokens)
+        for start, end in zip(boundaries[:-1], boundaries[1:])
+    ]
 
-            # Removing special tokens before pre-tokenization
-            segments = re.split("|".join(map(re.escape, special_tokens)), chunk)
-            for segment in segments:
-                # Run pre-tokenization on your chunk and store the counts for each pre-token
-                counts = pre_tokenize(segment)
+    with multiprocessing.Pool(num_processes) as pool:
+        results = pool.map(process_chunk, tasks)
 
-                for key, val in counts.items():
-                    tc = TokenChain(frequency=val)
-                    for i in key:
-                        tc.append(i)
-                    pre_tokens.append(tc)
+    pre_tokens = []
+    for tokens in results:
+        pre_tokens.extend(tokens)
 
     bpe_trainer = BPETrainer(vocab_size, special_tokens, pre_tokens)
     return bpe_trainer.train_bpe(vocab)
 
-
-def pre_tokenize(text: str) -> dict[tuple[bytes, bytes], int]:
-    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-    counts = defaultdict(int)
-    for match in re.finditer(PAT, text):
-        token = match.group()
-        token_byte_tuple = tuple(bytes([char]) for char in token.encode("utf-8"))
-        counts[token_byte_tuple] += 1
-    return counts
+byte_level_bpe()
